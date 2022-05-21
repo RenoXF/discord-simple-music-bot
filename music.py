@@ -1,101 +1,268 @@
-import discord
+import asyncio
 import os
-# load our local env so we dont have the token in public
-from dotenv import load_dotenv
+import discord
+import requests
+import youtube_dl
 from discord.ext import commands
-from discord.utils import get
-from discord import FFmpegPCMAudio
-from discord import TextChannel
-from youtube_dl import YoutubeDL
+from dotenv import load_dotenv
+
+import utilities
 
 load_dotenv()
-client = commands.Bot(command_prefix=',')  # prefix our commands with '.'
+# Save your discord token in a .env file and link it here.
+token = os.getenv('TOKENBOT')
 
-players = {}
+# Set the bot intents accordingly to be able to read info about guild members etc.
+intents = discord.Intents.default()
+intents.members = True
 
 
-@client.event
+
+# Change '/' to whatever prefix you want to use to call the bot on discord.
+bot = commands.Bot(command_prefix='/')
+
+
+
+@bot.event
 async def on_ready():
-    song_name=',help'  #Status name
-    activity_type=discord.ActivityType.listening #Status type
-    await client.change_presence(status=discord.Status.idle,activity=discord.Activity(type=a>
-    print(client.user.name)
+    activity = discord.Activity(type=discord.ActivityType.listening, name="Music use /help")
+    await bot.change_presence(status=discord.Status.idle, activity=activity)
+    print(bot.user.name)
 
-# command for bot to join the channel of the user, if the bot has already joined and is in a>
-@client.command()
-async def join(ctx):
-    channel = ctx.message.author.voice.channel
-    voice = get(client.voice_clients, guild=ctx.guild)
-    if voice and voice.is_connected():
-        await voice.move_to(channel)
+# YouTube is a bitch and tries to disconnect our bot from its servers. Use this to reconnect instantly.
+# (Because of this disconnect/reconnect cycle, sometimes you will listen a sudden and brief stop)
+FFMPEG_OPTIONS = {
+    'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5', 'options': '-vn'}
+
+# List with all the sessions currently active.
+# TODO: Terminate season after X minutes have passed without interaction.
+sessions = []
+
+
+def check_session(ctx):
+    """
+    Checks if there is a session with the same characteristics (guild and channel) as ctx param.
+    :param ctx: discord.ext.commands.Context
+    :return: session()
+    """
+    if len(sessions) > 0:
+        for i in sessions:
+            if i.guild == ctx.guild and i.channel == ctx.author.voice.channel:
+                return i
+        session = utilities.Session(
+            ctx.guild, ctx.author.voice.channel, id=len(sessions))
+        sessions.append(session)
+        return session
     else:
-        voice = await channel.connect()
-# command to play sound from a youtube URL
-@client.command()
-async def play(ctx, url):
-    YDL_OPTIONS = {'format': 'bestaudio', 'noplaylist': 'True', 'preferredquality': '192'}
-    FFMPEG_OPTIONS = {
-        'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5', 'opti>
-    voice = get(client.voice_clients, guild=ctx.guild)
+        session = utilities.Session(ctx.guild, ctx.author.voice.channel, id=0)
+        sessions.append(session)
+        return session
 
-    if not voice.is_playing():
-        with YoutubeDL(YDL_OPTIONS) as ydl:
-            info = ydl.extract_info(url, download=False)
-        URL = info['url']
-        voice.play(FFmpegPCMAudio(URL, **FFMPEG_OPTIONS))
-        voice.is_playing()
-        await ctx.send('Bot is playing')
 
-# check if the bot is already playing
-    else:
-        await ctx.send("Bot is already playing")
+def prepare_continue_queue(ctx):
+    """
+    Used to call next song in queue.
+    Because lambda functions cannot call async functions, I found this workaround in discord's api documentation
+    to let me continue playing the queue when the current song ends.
+    :param ctx: discord.ext.commands.Context
+    :return: None
+    """
+    fut = asyncio.run_coroutine_threadsafe(continue_queue(ctx), bot.loop)
+    try:
+        fut.result()
+    except Exception as e:
+        print(e)
+
+
+async def continue_queue(ctx):
+    """
+    Check if there is a next in queue then proceeds to play the next song in queue.
+    As you can see, in this method we create a recursive loop using the prepare_continue_queue to make sure we pass
+    through all songs in queue without any mistakes or interaction.
+    :param ctx: discord.ext.commands.Context
+    :return: None
+    """
+    session = check_session(ctx)
+    if not session.q.theres_next():
+        await ctx.send("Queue is over bro.")
         return
 
+    session.q.next()
 
-# command to resume voice if it is paused
-@client.command()
-async def resume(ctx):
-    voice = get(client.voice_clients, guild=ctx.guild)
-
-    if not voice.is_playing():
-        voice.resume()
-        await ctx.send('Bot is resuming')
-      # command to pause voice if it is playing
-@client.command()
-async def pause(ctx):
-    voice = get(client.voice_clients, guild=ctx.guild)
-
-    if voice.is_playing():
-        voice.pause()
-        await ctx.send('Bot has been paused')
-
-
-# command to stop voice
-@client.command()
-async def stop(ctx):
-    voice = get(client.voice_clients, guild=ctx.guild)
+    voice = discord.utils.get(bot.voice_clients, guild=session.guild)
+    source = await discord.FFmpegOpusAudio.from_probe(session.q.current_music.url, **FFMPEG_OPTIONS)
 
     if voice.is_playing():
         voice.stop()
-        await ctx.send('Stopping...')
+
+    voice.play(source, after=lambda e: prepare_continue_queue(ctx))
+    await ctx.send(session.q.current_music.thumb)
+    await ctx.send(f"Playing : {session.q.current_music.title}")
 
 
-@client.command()
-async def leave(ctx):
-    if (ctx.voice_client):
-        await ctx.guild.voice_client.disconnect()
-        await ctx.send('Bot left')
+@bot.command(name='play')
+async def play(ctx, *, arg):
+    """
+    Checks where the command's author is, searches for the music required, joins the same channel as the command's
+    author and then plays the audio directly from YouTube.
+    :param ctx: discord.ext.commands.Context
+    :param arg: str
+        arg can be url to video on YouTube or just as you would search it normally.
+    :return: None
+    """
+    try:
+        voice_channel = ctx.author.voice.channel
+
+    # If command's author isn't connected, return.
+    except AttributeError as e:
+        print(e)
+        await ctx.send("You're not connected to a voice channel, dumb!!")
+        return
+
+    # Finds author's session.
+    session = check_session(ctx)
+
+    # Searches for the video
+    with youtube_dl.YoutubeDL({'format': 'bestaudio', 'noplaylist': 'True'}) as ydl:
+        try:
+            requests.get(arg)
+        except Exception as e:
+            print(e)
+            info = ydl.extract_info(f"ytsearch:{arg}", download=False)[
+                'entries'][0]
+        else:
+            info = ydl.extract_info(arg, download=False)
+
+    url = info['formats'][0]['url']
+    thumb = info['thumbnails'][0]['url']
+    title = info['title']
+
+    session.q.enqueue(title, url, thumb)
+
+    # Finds an available voice client for the bot.
+    voice = discord.utils.get(bot.voice_clients, guild=ctx.guild)
+    if not voice:
+        await voice_channel.connect()
+        voice = discord.utils.get(bot.voice_clients, guild=ctx.guild)
+
+    # If it is already playing something, adds to the queue
+    if voice.is_playing():
+        await ctx.send(thumb)
+        await ctx.send(f"added to queue : {title}")
+        return
     else:
-        await ctx.send("I'm not in a voice channel, use the join command to make me join")
+        await ctx.send(thumb)
+        await ctx.send(f"playing now : {title}")
+
+        # Guarantees that the requested music is the current music.
+        session.q.set_last_as_current()
+
+        source = await discord.FFmpegOpusAudio.from_probe(url, **FFMPEG_OPTIONS)
+        voice.play(source, after=lambda ee: prepare_continue_queue(ctx))
 
 
-# command to clear channel messages
-@client.command()
-async def clear(ctx, amount=5):
-    await ctx.channel.purge(limit=amount)
-    await ctx.send("Messages have been cleared")
-      
-      
-      
-client.run(os.getenv('TOKEN'))
+@bot.command(name='next', aliases=['skip'])
+async def skip(ctx):
+    """
+    Skips the current song, playing the next one in queue if there is one.
+    :param ctx: discord.ext.commands.Context
+    :return: None
+    """
+    # Finds author's session.
+    session = check_session(ctx)
+    # If there isn't any song to be played next, return.
+    if not session.q.theres_next():
+        await ctx.send("There ain't shit in the queue, big man")
+        return
 
+    # Finds an available voice client for the bot.
+    voice = discord.utils.get(bot.voice_clients, guild=session.guild)
+
+    # If it is playing something, stops it. This works because of the "after" argument when calling voice.play as it is
+    # a recursive loop and the current song is already going to play the next song when it stops.
+    if voice.is_playing():
+        voice.stop()
+        return
+    else:
+        # If nothing is playing, finds the next song and starts playing it.
+        session.q.next()
+        source = await discord.FFmpegOpusAudio.from_probe(session.q.current_music.url, **FFMPEG_OPTIONS)
+        voice.play(source, after=lambda e: prepare_continue_queue(ctx))
+        return
+
+
+@bot.command(name='print')
+async def print_info(ctx):
+    """
+    A debug command to find session id, what is current playing and what is on the queue.
+    :param ctx: discord.ext.commands.Context
+    :return: None
+    """
+    session = check_session(ctx)
+    await ctx.send(f"Session ID : {session.id}")
+    await ctx.send(f"current song : {session.q.current_music.title}")
+    queue = [q[0] for q in session.q.queue]
+    await ctx.send(f"queue: {queue}")
+
+
+@bot.command(name='leave')
+async def leave(ctx):
+    """
+    If bot is connected to a voice channel, it leaves it.
+    :param ctx: discord.ext.commands.Context
+    :return: None
+    """
+    voice = discord.utils.get(bot.voice_clients, guild=ctx.guild)
+    if voice.is_connected:
+        check_session(ctx).q.clear_queue()
+        await voice.disconnect()
+    else:
+        await ctx.send("Bot not connect, so it can't leave.")
+
+
+@bot.command(name='pause')
+async def pause(ctx):
+    """
+    If playing audio, pause it.
+    :param ctx: discord.ext.commands.Context
+    :return: None
+    """
+    voice = discord.utils.get(bot.voice_clients, guild=ctx.guild)
+    if voice.is_playing():
+        voice.pause()
+    else:
+        await ctx.send("It's not fucking playing man, it's going to be dumb in hell")
+
+
+@bot.command(name='resume')
+async def resume(ctx):
+    """
+    If audio is paused, resumes playing it.
+    :param ctx: discord.ext.commands.Context
+    :return: None
+    """
+    voice = discord.utils.get(bot.voice_clients, guild=ctx.guild)
+    if voice.is_paused:
+        voice.resume()
+    else:
+        await ctx.send("Music is already paused")
+
+
+@bot.command(name='stop')
+async def stop(ctx):
+    """
+    Stops playing audio and clears the session's queue.
+    :param ctx: discord.ext.commands.Context
+    :return: None
+    """
+    session = check_session(ctx)
+    voice = discord.utils.get(bot.voice_clients, guild=ctx.guild)
+    if voice.is_playing:
+        voice.stop()
+        session.q.clear_queue()
+    else:
+        await ctx.send("There's nothing playing oh fool.")
+
+
+# Runs bot's loop.
+bot.run(token)
